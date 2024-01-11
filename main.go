@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"flag"
 	"fmt"
 	_ "github.com/go-sql-driver/mysql"
 	"log"
@@ -13,16 +14,39 @@ import (
 )
 
 const (
-	host      = "127.0.0.1"
-	port      = 4000
-	user      = "root"
-	password  = ""
-	schema    = "simplebench"
-	tableName = "combinedPK"
-	//characters = "abcdefghijklmnopqrstuvwxyz"
-	characters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01234567890!@#$^&*()-_=+,.?/:;<>{}|"
-	tableRows  = 10000000
+	defHost       = "127.0.0.1"
+	defPort       = "4000"
+	defUser       = "root"
+	defPassword   = ""
+	defSchemaName = "simplebench"
+	defTableName  = "combinedPK"
+	characters    = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01234567890!@#$^&*()-_=+,.?/:;<>{}|"
+	tableRows     = 10000000
+	days          = 900
 )
+
+var schemaName, tableName, user, password *string
+var selectConcurrency *uint
+var selectDuration *time.Duration
+
+type flagHosts []string
+
+var dbHosts flagHosts
+
+func (h *flagHosts) String() string {
+	return strings.Join(*h, ",")
+}
+
+func (h *flagHosts) Set(s string) error {
+	if strings.Contains(s, ",") {
+		for _, v := range strings.Split(s, ",") {
+			*h = append(*h, v)
+		}
+	} else {
+		*h = append(*h, s)
+	}
+	return nil
+}
 
 func randomChars(num int, sb *strings.Builder) error {
 	for j := 0; j < num; j++ {
@@ -34,22 +58,22 @@ func randomChars(num int, sb *strings.Builder) error {
 	return nil
 }
 
-func insert(start, end uint32) error {
-	dbConnectString := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s", user, password, host, port, schema)
+func insert(start, end uint, host string) error {
+	dbConnectString := fmt.Sprintf("%s:%s@tcp(%s)/%s", *user, *password, host, *schemaName)
 	db, err := sql.Open("mysql", dbConnectString)
 	if err != nil {
 		return err
 	}
-	batchSize := uint32(1000)
+	batchSize := uint(1000)
 	var sb strings.Builder
 	for ; start < end; start += batchSize {
 		sb.Reset()
-		sb.WriteString("insert into " + tableName + " values ")
-		for i := uint32(0); i < batchSize; i++ {
+		sb.WriteString("insert into " + *tableName + " values ")
+		for i := uint(0); i < batchSize; i++ {
 			if i != 0 {
 				sb.WriteString(",")
 			}
-			id := start + i
+			id := uint32(start + i)
 			_, err = fmt.Fprintf(&sb, "('%08x%08X%08x%08d'",
 				bits.Reverse32(id), id^0x01234567, id^0x76543210, id)
 			if err != nil {
@@ -70,7 +94,7 @@ func insert(start, end uint32) error {
 				}
 			}
 			d := time.Duration(rand.Intn(86400)) * time.Second
-			t := time.Now().AddDate(0, 0, 0-rand.Intn(900)).Add(-d)
+			t := time.Now().AddDate(0, 0, 0-rand.Intn(days)).Add(-d)
 			_, err = fmt.Fprintf(&sb, ",%d,'%s','", i, t.Format(time.DateTime))
 			if err != nil {
 				return err
@@ -91,21 +115,22 @@ func insert(start, end uint32) error {
 	return nil
 }
 
-func insertRoutine(start, end uint32, ch chan error) {
-	err := insert(start, end)
+func insertRoutine(start, end uint, host string, ch chan error) {
+	err := insert(start, end, host)
 	ch <- err
 }
 
-func parallelInsert(start, end uint32) (err error) {
+func parallelInsert(start, end uint) (err error) {
 	ch := make(chan error, 3)
-	routines := uint32(10)
+	routines := uint(10)
 	size := (end - start) / routines
 	concurrentInserts := 0
 	t := time.Now()
-	fmt.Printf("Starting insert: %s", t.Format(time.RFC3339))
+	fmt.Printf("Starting insert: %s\n", t.Format(time.RFC3339))
 	for i := start; i < end; i += size {
-		fmt.Printf("Inserting %d < %d\n", i, i+size)
-		go insertRoutine(i, i+size, ch)
+		host := dbHosts[concurrentInserts%len(dbHosts)]
+		fmt.Printf("Inserting %d < %d on host %s\n", i, i+size, host)
+		go insertRoutine(i, i+size, host, ch)
 		concurrentInserts++
 	}
 	for i := 0; i < concurrentInserts; i++ {
@@ -115,33 +140,34 @@ func parallelInsert(start, end uint32) (err error) {
 			break
 		}
 	}
-	fmt.Printf("Done insert: %s\nDuration: %s", time.Now().Format(time.RFC3339), t.Sub(time.Now()).String())
+	fmt.Printf("Done insert: %s %s\n", time.Now().Format(time.RFC3339), time.Now().Sub(t).String())
 	return err
 }
 
 type report struct {
-	queries    uint32
+	queries    uint
 	totalTime  time.Duration
 	minLatency time.Duration
 	maxLatency time.Duration
 }
 
-func selectPK(start, end uint32, dur time.Duration, ch chan report) {
-	dbConnectString := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s", user, password, host, port, schema)
+func selectPK(start, end uint, host string, dur time.Duration, ch chan report) {
+	dbConnectString := fmt.Sprintf("%s:%s@tcp(%s)/%s", *user, *password, host, *schemaName)
 	db, err := sql.Open("mysql", dbConnectString)
 	if err != nil {
 		log.Fatalf("Could not connect to database: %v", err)
 	}
+	//fmt.Printf("Starting selects between %d and %d on host %s\n", start, end, host)
 	var rep report
 	startT := time.Now()
 	reportT := startT
 	// TODO: Should we really include all columns, especially the payload one?
-	sql := "select * from " + tableName + " where id = "
+	sqlStr := "select * from " + *tableName + " where id = "
 	for {
-		id := rand.Uint32()%(end-start) + start
+		id := rand.Uint32()%uint32(end-start) + uint32(start)
 		idStr := fmt.Sprintf("'%08x%08X%08x%08d'", bits.Reverse32(id), id^0x01234567, id^0x76543210, id)
 		beforeT := time.Now()
-		res, err := db.Query(sql + idStr)
+		res, err := db.Query(sqlStr + idStr)
 		if err != nil {
 			log.Fatalf("Could not select: %v", err)
 		}
@@ -191,17 +217,19 @@ func selectPK(start, end uint32, dur time.Duration, ch chan report) {
 	}
 }
 
-func runSelects(start, end uint32) {
+func runSelects(start, end uint) {
 	// TODO: Increase number of threads, start by 1, the *2 until QPS is decreased 25% or threads > 2000
-	concurrency := 100
-	dur := 5 * 60 * time.Second
 	ch := make(chan report, 10000)
 	var wg sync.WaitGroup
 	tStart := time.Now()
-	for i := 0; i < concurrency; i++ {
+	if *selectConcurrency < 1 {
+		*selectConcurrency = 100
+	}
+	for i := 0; i < int(*selectConcurrency); i++ {
+		host := dbHosts[i%len(dbHosts)]
 		wg.Add(1)
 		go func() {
-			selectPK(start, end, dur, ch)
+			selectPK(start, end, host, *selectDuration, ch)
 			wg.Done()
 		}()
 	}
@@ -235,8 +263,12 @@ func runSelects(start, end uint32) {
 				break
 			}
 		}
-		fmt.Printf("c % 8d\tq % 8d\tt % 8d ms\tmin % 8d us\tmax % 8d us\n",
-			count, rep.queries, rep.totalTime.Milliseconds(), rep.minLatency.Microseconds(), rep.maxLatency.Microseconds())
+		avgLat := int64(0)
+		if rep.queries > 0 {
+			avgLat = rep.totalTime.Microseconds() / int64(rep.queries)
+		}
+		fmt.Printf("c % 8d\tq % 8d\tt % 8d ms\tmin % 8d us\tmax % 8d us\tavg % 8d us\n",
+			count, rep.queries, rep.totalTime.Milliseconds(), rep.minLatency.Microseconds(), rep.maxLatency.Microseconds(), avgLat)
 		if totRep.queries == 0 || totRep.minLatency > rep.minLatency {
 			if rep.minLatency > 0 {
 				totRep.minLatency = rep.minLatency
@@ -248,21 +280,43 @@ func runSelects(start, end uint32) {
 		totRep.queries += rep.queries
 		totRep.totalTime += rep.totalTime
 		totCount += count
-		if tStart.Before(time.Now().Add(-dur - 10*time.Second)) {
+		if tStart.Before(time.Now().Add(-*selectDuration)) && rep.queries == 0 {
 			break
 		}
 	}
-	fmt.Printf("T % 8d\tq % 8d\tt % 8d ms\tmin % 8d us\tmax % 8d us\n",
-		totCount, totRep.queries, totRep.totalTime.Milliseconds(), totRep.minLatency.Microseconds(), totRep.maxLatency.Microseconds())
+	totLat := int64(0)
+	if totRep.queries > 0 {
+		totLat = totRep.totalTime.Microseconds() / int64(totRep.queries)
+	}
+	fmt.Printf("T % 8d\tq % 8d\tt % 8d ms\tmin % 8d us\tmax % 8d us\tavg % 8d us\n",
+		totCount, totRep.queries, totRep.totalTime.Milliseconds(), totRep.minLatency.Microseconds(), totRep.maxLatency.Microseconds(), totLat)
 	wg.Wait()
 	fmt.Printf("Selects all done!\n")
 }
 
 func main() {
+	numPartitions := flag.Uint("parts", 0, "Number of partitions, 0 = non-partitioned table")
+	createNewTable := flag.Bool("create", true, "Create the database and (re)create table")
+	newRows := flag.Bool("insert", true, "insert -rows number of rows in the table")
+	numRows := flag.Uint("rows", tableRows, "number of rows in the table")
+	schemaName = flag.String("schema", defSchemaName, "Use this schema name")
+	tableName = flag.String("table", defTableName, "Use this table name")
+	doSelect := flag.Bool("select", true, "Run select PK benchmark")
+	sleepTime := flag.Uint("sleep", 10, "Sleep this number of seconds before select benchmark")
+	user = flag.String("user", defUser, "database user name")
+	password = flag.String("password", defPassword, "database user password")
+	selectDuration = flag.Duration("duration", 60*time.Second, "Duration of select benchmark")
+	selectConcurrency = flag.Uint("concurrency", 100, "number of concurrent selects")
+	flag.Var(&dbHosts, "host", "database host:port, give multiple time or as a comma separated list")
+	flag.Parse()
+
+	if len(dbHosts) == 0 {
+		dbHosts = append(dbHosts, defHost+":"+defPort)
+	}
 	var err error
-	if true {
+	if *createNewTable {
 		// (re)create database and table
-		dbConnectString := fmt.Sprintf("%s:%s@tcp(%s:%d)/", user, password, host, port)
+		dbConnectString := fmt.Sprintf("%s:%s@tcp(%s)/", *user, *password, dbHosts[0])
 		db, err := sql.Open("mysql", dbConnectString)
 		if err != nil {
 			log.Fatalf("Could not connect to database: %v", err)
@@ -272,21 +326,28 @@ func main() {
 		}
 
 		// Populate the table
-		_, err = db.Exec("drop schema if exists " + schema)
-		if err != nil {
-			log.Fatalf("Error cleaning up old schema simplebench: %v", err)
-		}
-		_, err = db.Exec("create schema " + schema)
+		/*
+			_, err = db.Exec("drop schema if exists " + schema)
+			if err != nil {
+				log.Fatalf("Error cleaning up old schema simplebench: %v", err)
+			}
+		*/
+		_, err = db.Exec("create schema if not exists " + *schemaName)
 		if err != nil {
 			log.Fatalf("Error creating schema simplebench: %v", err)
 		}
 
-		_, err = db.Exec("use " + schema)
+		_, err = db.Exec("use " + *schemaName)
 		if err != nil {
 			log.Fatalf("Error using schema simplebench: %v", err)
 		}
 
-		createSQL := "create table " + tableName + ` 
+		_, err = db.Exec("drop table if exists " + *tableName)
+		if err != nil {
+			log.Fatalf("Error using schema simplebench: %v", err)
+		}
+
+		createSQL := "create table " + *tableName + ` 
 (id varchar(32) not null, -- actual PK
  a varchar(32) not null,
  b varchar(32) not null,
@@ -296,19 +357,19 @@ func main() {
  ts timestamp not null default current_timestamp,
  payload varchar(10240) not null,
 		PRIMARY KEY (id,ts))`
-		//PRIMARY KEY (id))`
-		if true {
-			partitionBy := ` partition by range (unix_timestamp(ts))
-(partition p2021 values less than (unix_timestamp('2022-01-01')),
- partition p2022 values less than (unix_timestamp('2023-01-01')),
- partition p2023 values less than (unix_timestamp('2024-01-01')),
- partition p2024 values less than (unix_timestamp('2025-01-01')))`
-			fmt.Println(createSQL + partitionBy)
-			_, err = db.Exec(createSQL + partitionBy)
-		} else {
-			fmt.Println(createSQL)
-			_, err = db.Exec(createSQL)
+		if *numPartitions > 0 {
+			createSQL += ` partition by range (unix_timestamp(ts))\n(`
+			interval := days / *numPartitions
+			t := time.Now().Add(-days * time.Hour * 24)
+			for i := uint(1); i < *numPartitions; i++ {
+				dateStr := t.Format(time.DateOnly)
+				t.Add(time.Duration(interval) * 24 * time.Hour)
+				createSQL += "partition `p" + dateStr + "` values less than (unix_timestamp('" + dateStr + "')),"
+			}
+			createSQL += "partition pMax values less than (maxvalue))"
 		}
+		fmt.Println(createSQL)
+		_, err = db.Exec(createSQL)
 		if err != nil {
 			log.Fatalf("Error creating table: %v", err)
 		}
@@ -320,11 +381,15 @@ func main() {
 	}
 
 	// spawn goroutines to run queries, including report qps and latency
-	err = parallelInsert(0, tableRows)
-	if err != nil {
-		log.Fatalf("Error populating table: %v", err)
+	if *newRows {
+		err = parallelInsert(0, *numRows)
+		if err != nil {
+			log.Fatalf("Error populating table: %v", err)
+		}
 	}
 
-	time.Sleep(300 * time.Second)
-	runSelects(0, tableRows)
+	if *doSelect {
+		time.Sleep(time.Duration(*sleepTime) * time.Second)
+		runSelects(0, *numRows)
+	}
 }
