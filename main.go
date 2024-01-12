@@ -68,7 +68,7 @@ func insert(start, end uint, host string) error {
 	var sb strings.Builder
 	for ; start < end; start += batchSize {
 		sb.Reset()
-		sb.WriteString("insert into " + *tableName + " values ")
+		sb.WriteString("insert into `" + *tableName + "` values ")
 		for i := uint(0); i < batchSize; i++ {
 			if i != 0 {
 				sb.WriteString(",")
@@ -162,7 +162,7 @@ func selectPK(start, end uint, host string, dur time.Duration, ch chan report) {
 	startT := time.Now()
 	reportT := startT
 	// TODO: Should we really include all columns, especially the payload one?
-	sqlStr := "select * from " + *tableName + " where id = "
+	sqlStr := "select * from `" + *tableName + "` where id = "
 	for {
 		id := rand.Uint32()%uint32(end-start) + uint32(start)
 		idStr := fmt.Sprintf("'%08x%08X%08x%08d'", bits.Reverse32(id), id^0x01234567, id^0x76543210, id)
@@ -296,13 +296,14 @@ func runSelects(start, end uint) {
 
 func main() {
 	numPartitions := flag.Uint("parts", 0, "Number of partitions, 0 = non-partitioned table")
-	createNewTable := flag.Bool("create", true, "Create the database and (re)create table")
-	newRows := flag.Bool("insert", true, "insert -rows number of rows in the table")
+	createNewTable := flag.Bool("create", false, "Create the database and (re)create table")
+	newRows := flag.Bool("insert", false, "insert -rows number of rows in the table")
 	numRows := flag.Uint("rows", tableRows, "number of rows in the table")
 	schemaName = flag.String("schema", defSchemaName, "Use this schema name")
 	tableName = flag.String("table", defTableName, "Use this table name")
-	doSelect := flag.Bool("select", true, "Run select PK benchmark")
-	sleepTime := flag.Uint("sleep", 10, "Sleep this number of seconds before select benchmark")
+	doSelect := flag.Bool("select", false, "Run select PK benchmark")
+	sleepTime := flag.Uint("sleep", 10, "Sleep this number of seconds between insert and select benchmark")
+	pkCols := flag.String("pkcols", "id,ts", "Primary columns")
 	user = flag.String("user", defUser, "database user name")
 	password = flag.String("password", defPassword, "database user password")
 	selectDuration = flag.Duration("duration", 60*time.Second, "Duration of select benchmark")
@@ -342,12 +343,12 @@ func main() {
 			log.Fatalf("Error using schema simplebench: %v", err)
 		}
 
-		_, err = db.Exec("drop table if exists " + *tableName)
+		_, err = db.Exec("drop table if exists `" + *tableName + "`")
 		if err != nil {
 			log.Fatalf("Error using schema simplebench: %v", err)
 		}
 
-		createSQL := "create table " + *tableName + ` 
+		createSQL := "create table `" + *tableName + "`" + ` 
 (id varchar(32) not null, -- actual PK
  a varchar(32) not null,
  b varchar(32) not null,
@@ -355,16 +356,22 @@ func main() {
  d varchar(32) not null,
  e int not null,
  ts timestamp not null default current_timestamp,
- payload varchar(10240) not null,
-		PRIMARY KEY (id,ts))`
+ payload varchar(10240) not null,`
+		createSQL += "\n PRIMARY KEY (" + *pkCols + "))"
 		if *numPartitions > 0 {
-			createSQL += ` partition by range (unix_timestamp(ts))\n(`
+			createSQL += "\npartition by range (unix_timestamp(ts))\n("
 			interval := days / *numPartitions
 			t := time.Now().Add(-days * time.Hour * 24)
 			for i := uint(1); i < *numPartitions; i++ {
+				if i > 1 {
+					createSQL += " "
+				}
+				t = t.Add(time.Duration(interval) * 24 * time.Hour)
 				dateStr := t.Format(time.DateOnly)
-				t.Add(time.Duration(interval) * 24 * time.Hour)
-				createSQL += "partition `p" + dateStr + "` values less than (unix_timestamp('" + dateStr + "')),"
+				createSQL += "partition `p" + dateStr + "` values less than (unix_timestamp('" + dateStr + "')),\n"
+			}
+			if *numPartitions == 1 {
+				createSQL += " "
 			}
 			createSQL += "partition pMax values less than (maxvalue))"
 		}
@@ -389,7 +396,9 @@ func main() {
 	}
 
 	if *doSelect {
-		time.Sleep(time.Duration(*sleepTime) * time.Second)
+		if *newRows {
+			time.Sleep(time.Duration(*sleepTime) * time.Second)
+		}
 		runSelects(0, *numRows)
 	}
 }
