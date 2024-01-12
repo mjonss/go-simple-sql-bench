@@ -1,0 +1,2 @@
+[storage.block-cache]
+capacity = "8GB"
