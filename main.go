@@ -95,7 +95,7 @@ func insert(start, end uint, host string) error {
 			}
 			d := time.Duration(rand.Intn(86400)) * time.Second
 			t := time.Now().AddDate(0, 0, 0-rand.Intn(days)).Add(-d)
-			_, err = fmt.Fprintf(&sb, ",%d,'%s','", i, t.Format(time.DateTime))
+			_, err = fmt.Fprintf(&sb, ",%d,'%s','", start+i, t.Format(time.DateTime))
 			if err != nil {
 				return err
 			}
