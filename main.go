@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"flag"
 	"fmt"
@@ -28,6 +29,7 @@ const (
 var schemaName, tableName, user, password *string
 var selectConcurrency *uint
 var selectDuration *time.Duration
+var jsonTest *bool
 
 type flagHosts []string
 
@@ -294,6 +296,35 @@ func runSelects(start, end uint) {
 	fmt.Printf("Selects all done!\n")
 }
 
+func writeFlatJSON(db *sql.DB, key string, pathsToSet map[string]interface{}, pathsToDelete []string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		log.Fatalf("Could not connect to database: %v", err)
+	}
+	defer tx.Rollback()
+
+	insertSQL := "INSERT INTO " + *tableName + " VALUES(?, ?, ?) ON DUPLICATE KEY UPDATE `value` = ?"
+	deleteSQL := "DELETE FROM " + *tableName + " WHERE `key` = ? AND `path` = ?"
+
+	for path, value := range pathsToSet {
+		_, err = tx.ExecContext(ctx, insertSQL, key, path, value, value)
+		if err != nil {
+			log.Fatalf("Could not insert ... on duplicate key update: %v", err)
+		}
+	}
+	for _, path := range pathsToDelete {
+		_, err = tx.ExecContext(ctx, deleteSQL, key, path)
+		log.Fatalf("Could not delete: %v", err)
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		log.Fatalf("Could not delete: %v", err)
+	}
+}
+
 func main() {
 	numPartitions := flag.Uint("parts", 0, "Number of partitions, 0 = non-partitioned table")
 	createNewTable := flag.Bool("create", false, "Create the database and (re)create table")
@@ -304,10 +335,12 @@ func main() {
 	doSelect := flag.Bool("select", false, "Run select PK benchmark")
 	sleepTime := flag.Uint("sleep", 10, "Sleep this number of seconds between insert and select benchmark")
 	pkCols := flag.String("pkcols", "id,ts", "Primary columns")
+	jsonTest = flag.Bool("json", false, "Run decomposed json test")
 	user = flag.String("user", defUser, "database user name")
 	password = flag.String("password", defPassword, "database user password")
 	selectDuration = flag.Duration("duration", 60*time.Second, "Duration of select benchmark")
 	selectConcurrency = flag.Uint("concurrency", 100, "number of concurrent selects")
+	recreateSchema := flag.Bool("recreate-schema", false, "If the schema already exists, drop it and recreate it")
 	flag.Var(&dbHosts, "host", "database host:port, give multiple time or as a comma separated list")
 	flag.Parse()
 
@@ -327,12 +360,12 @@ func main() {
 		}
 
 		// Populate the table
-		/*
-			_, err = db.Exec("drop schema if exists " + schema)
+		if *recreateSchema {
+			_, err = db.Exec("drop schema if exists " + *schemaName)
 			if err != nil {
 				log.Fatalf("Error cleaning up old schema simplebench: %v", err)
 			}
-		*/
+		}
 		_, err = db.Exec("create schema if not exists " + *schemaName)
 		if err != nil {
 			log.Fatalf("Error creating schema simplebench: %v", err)
@@ -348,7 +381,9 @@ func main() {
 			log.Fatalf("Error using schema simplebench: %v", err)
 		}
 
-		createSQL := "create table `" + *tableName + "`" + ` 
+		var createSQL string
+		if !*jsonTest {
+			createSQL = "create table `" + *tableName + "`" + ` 
 (id varchar(32) not null, -- actual PK
  a varchar(32) not null,
  b varchar(32) not null,
@@ -357,23 +392,30 @@ func main() {
  e int not null,
  ts timestamp not null default current_timestamp,
  payload varchar(10240) not null,`
-		createSQL += "\n PRIMARY KEY (" + *pkCols + "))"
-		if *numPartitions > 0 {
-			createSQL += "\npartition by range (unix_timestamp(ts))\n("
-			interval := days / *numPartitions
-			t := time.Now().Add(-days * time.Hour * 24)
-			for i := uint(1); i < *numPartitions; i++ {
-				if i > 1 {
+			createSQL += "\n PRIMARY KEY (" + *pkCols + "))"
+			if *numPartitions > 0 {
+				createSQL += "\npartition by range (unix_timestamp(ts))\n("
+				interval := days / *numPartitions
+				t := time.Now().Add(-days * time.Hour * 24)
+				for i := uint(1); i < *numPartitions; i++ {
+					if i > 1 {
+						createSQL += " "
+					}
+					t = t.Add(time.Duration(interval) * 24 * time.Hour)
+					dateStr := t.Format(time.DateOnly)
+					createSQL += "partition `p" + dateStr + "` values less than (unix_timestamp('" + dateStr + "')),\n"
+				}
+				if *numPartitions == 1 {
 					createSQL += " "
 				}
-				t = t.Add(time.Duration(interval) * 24 * time.Hour)
-				dateStr := t.Format(time.DateOnly)
-				createSQL += "partition `p" + dateStr + "` values less than (unix_timestamp('" + dateStr + "')),\n"
+				createSQL += "partition pMax values less than (maxvalue))"
 			}
-			if *numPartitions == 1 {
-				createSQL += " "
-			}
-			createSQL += "partition pMax values less than (maxvalue))"
+		} else {
+			createSQL = "create table `" + *tableName + "`" + ` 
+key varchar(255),
+path varchar(255),
+value TEXT,
+PRIMARY KEY (key, path)`
 		}
 		fmt.Println(createSQL)
 		_, err = db.Exec(createSQL)
